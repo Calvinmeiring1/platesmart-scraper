@@ -1,13 +1,24 @@
-import os, re, json, time, asyncio
+# scrape_prices.py
+# Checkers/Sixty60 search scraper (Playwright + BeautifulSoup).
+# - Loads search results in a headless browser
+# - Finds product cards with tolerant selectors (handles CSS modules)
+# - Extracts name, price (full+half spans), size/UOM (or from name)
+# - Computes price-per-kg/L/each and picks best match
+# - Writes to Firestore: prices/{REGION}/stores/CHECKERS/items/{ingredient}
+# - Saves debug HTML/PNG when no cards found
+
+import os, re, json, asyncio
 from typing import List, Optional, Tuple, Dict, Any
-from google.cloud import firestore
 from bs4 import BeautifulSoup
+from google.cloud import firestore
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 REGIONS = os.getenv("REGIONS", "ZA-WC-CT").split(",")
 STORE = os.getenv("STORE", "CHECKERS")
 INGREDIENTS_JSON = os.getenv("INGREDIENTS_JSON", '["cheddar cheese","milk","beef mince"]')
+
 PAUSE_MS = 1000
+TIMEOUT_NAV_MS = 60000
 SEARCH_URL = "https://www.checkers.co.za/search/all?q={}"
 
 # ---------- Firestore ----------
@@ -77,50 +88,35 @@ def pick_best(ingredient: str, hits: List[Dict[str, Any]]) -> Optional[Dict[str,
     if not hits: return None
     return sorted(hits, key=lambda h: (-sim_words(ingredient, h["name"]), h["ppu"]))[0]
 
-# ---------- selector helpers based on your snippet ----------
-# container like: <div class="product-card_container__4EAMJ ...">
-CARD_SEL  = 'div[class*="product-card_container__"]'
-# name like: <p class="product-card_product-name__8wxGT">...</p>
-NAME_SELS = ['[class*="product-card_product-name__"]',
-             '.product-card__name', '.product-title', '.product__name', '[itemprop="name"]']
-# price like: <p class="price-display_price-text__... product-card_product-price___...">
-# inside it: <span class="price-display_full__...">R84</span><span class="price-display_half__...">.99</span>
+# ---------- selectors (tolerant) ----------
+CARD_SELECTORS = [
+    'div[class*="product-card_container__"]',
+    'div[class*="product-card_content__"]',
+    'div.product-card', 'div.product-grid__item', 'div.product', 'div.product-tile',
+    '[data-component="product-card"]'
+]
+
+NAME_SELECTORS = [
+    '[class*="product-card_product-name__"]',
+    '.product-card__name',
+    '.product-title',
+    '.product__name',
+    '[itemprop="name"]',
+    '[class*="product-name"]',
+]
+
 PRICE_FULL_SEL = '[class*="price-display_full__"]'
 PRICE_HALF_SEL = '[class*="price-display_half__"]'
-PRICE_FALLBACKS = ['.price', '.product__price', '.product-price', '[data-price]']
-# sometimes size is separate; if not we parse from name
-SIZE_SELS  = ['[class*="product-list__item-size"]', '.uom', '.product__size', '.product-size', '.size']
+PRICE_FALLBACKS = [
+    '[class*="product-price"]',
+    '.price', '.product__price', '.product-price',
+    '[data-price]',
+]
 
-async def get_rendered_html(p, url: str, debug_key: str) -> str:
-    browser = await p.chromium.launch(headless=True)
-    page = await browser.new_page()
-    try:
-        await page.goto(url, timeout=60000)
-        # try cookie / promo banners
-        for sel in ["button:has-text('Accept')", "button:has-text('GOT IT')", "button:has-text('I agree')"]:
-            try: await page.locator(sel).click(timeout=2500)
-            except: pass
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=20000)
-            await page.wait_for_load_state("networkidle", timeout=20000)
-        except PWTimeout:
-            pass
-        await page.wait_for_timeout(1500)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight/2)")
-        await page.wait_for_timeout(800)
-        html = await page.content()
-
-        # debug dump if we cannot find cards
-        soup = BeautifulSoup(html, "lxml")
-        if not soup.select_one(CARD_SEL):
-            os.makedirs("debug", exist_ok=True)
-            with open(f"debug/{debug_key}.html", "w", encoding="utf-8") as f:
-                f.write(html[:150_000])
-            await page.screenshot(path=f"debug/{debug_key}.png", full_page=True)
-            print(f"[DEBUG] wrote debug/{debug_key}.html and .png (no product-card containers found)")
-        return html
-    finally:
-        await browser.close()
+SIZE_SELECTORS = [
+    '[class*="product-list__item-size"]',
+    '.uom', '.product__size', '.product-size', '.size'
+]
 
 def sel_text(el, selectors: List[str]) -> str:
     for s in selectors:
@@ -130,30 +126,70 @@ def sel_text(el, selectors: List[str]) -> str:
     return ""
 
 def get_price_from_card(card) -> Optional[float]:
-    # Prefer the "full" + "half" split (R and cents separated)
+    # Preferred split form (e.g., "R84" + ".99")
     full = card.select_one(PRICE_FULL_SEL)
     half = card.select_one(PRICE_HALF_SEL)
     if full:
         ft = full.get_text(strip=True)
         ht = half.get_text(strip=True) if half else ""
-        txt = f"{ft}{ht}"  # e.g., "R84" + ".99" -> "R84.99"
-        t = txt.replace(" ", "").replace(",", ".")
-        m = re.search(r"(\d+(?:\.\d+)?)", t.lstrip("Rr"))
-        if m: return float(m.group(1))
-    # Fallbacks
+        txt = f"{ft}{ht}".replace(" ", "").replace(",", ".").lstrip("Rr")
+        m = re.search(r"(\d+(?:\.\d+)?)", txt)
+        if m:
+            return float(m.group(1))
+
+    # Fallbacks: single price node or data-price attr
     for s in PRICE_FALLBACKS:
         n = card.select_one(s)
         if n:
-            raw = n.get_text(" ", strip=True)
-            raw = raw.replace(",", ".")
+            raw = n.get_text(" ", strip=True).replace(",", ".")
             m = re.search(r"(\d+(?:\.\d+)?)", raw)
             if m: return float(m.group(1))
-        # attribute fallback (data-price)
-        n = card.select_one(s)
-        if n and n.has_attr("data-price"):
-            try: return float(n["data-price"])
-            except: pass
+            if n.has_attr("data-price"):
+                try: return float(n["data-price"])
+                except: pass
     return None
+
+# ---------- page load & parsing ----------
+async def get_rendered_html(p, url: str, debug_key: str) -> str:
+    browser = await p.chromium.launch(headless=True)
+    page = await browser.new_page()
+    try:
+        await page.goto(url, timeout=TIMEOUT_NAV_MS)
+        # Try cookie/promo banners
+        for sel in ["button:has-text('Accept')", "button:has-text('GOT IT')", "button:has-text('I agree')"]:
+            try:
+                await page.locator(sel).click(timeout=2500)
+                break
+            except Exception:
+                pass
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=20000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except PWTimeout:
+            pass
+        # Attempt to load more tiles
+        for _ in range(4):
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(600)
+
+        html = await page.content()
+
+        # Debug dump if no cards detected
+        soup = BeautifulSoup(html, "lxml")
+        found_any = False
+        for cs in CARD_SELECTORS:
+            if soup.select_one(cs):
+                found_any = True
+                break
+        if not found_any:
+            os.makedirs("debug", exist_ok=True)
+            with open(f"debug/{debug_key}.html", "w", encoding="utf-8") as f:
+                f.write(html[:150_000])
+            await page.screenshot(path=f"debug/{debug_key}.png", full_page=True)
+            print(f"[DEBUG] wrote debug/{debug_key}.html and .png (no product cards found)")
+        return html
+    finally:
+        await browser.close()
 
 async def search_checkers(p, ingredient: str) -> List[Dict[str, Any]]:
     url = SEARCH_URL.format(ingredient.replace(" ", "+"))
@@ -161,17 +197,25 @@ async def search_checkers(p, ingredient: str) -> List[Dict[str, Any]]:
     html = await get_rendered_html(p, url, debug_key)
     soup = BeautifulSoup(html, "lxml")
 
-    cards = soup.select(CARD_SEL)
-    if not cards:
-        # try some older fallbacks too
-        alt_cards = soup.select(".product-card, .product-grid__item, .product, .product-tile")
-        cards = alt_cards
+    # collect from all matching containers
+    cards: List[Any] = []
+    for cs in CARD_SELECTORS:
+        found = soup.select(cs)
+        if found:
+            cards.extend(found)
+    # de-dup while preserving order
+    seen = set()
+    uniq_cards = []
+    for c in cards:
+        if id(c) not in seen:
+            uniq_cards.append(c)
+            seen.add(id(c))
+    cards = uniq_cards
 
     hits: List[Dict[str, Any]] = []
-    for card in cards[:12]:
-        name = sel_text(card, NAME_SELS)
+    for card in cards[:24]:
+        name = sel_text(card, NAME_SELECTORS)
         if not name:
-            # sometimes the name is the image alt/title
             img = card.select_one("img[alt]")
             if img and img.get("alt"):
                 name = img["alt"]
@@ -180,16 +224,16 @@ async def search_checkers(p, ingredient: str) -> List[Dict[str, Any]]:
         if not name or price_val is None:
             continue
 
-        # size: explicit element or parse from name itself
-        size_text = sel_text(card, SIZE_SELS) or name
+        size_text = sel_text(card, SIZE_SELECTORS) or name
         qty, unit_type, display = parse_size(size_text)
 
-        # link + image
         link = None
         a = card.select_one("a[href]")
         if a and a.get("href"):
             link = a["href"]
-            if link.startswith("/"): link = f"https://www.checkers.co.za{link}"
+            if link.startswith("/"):
+                link = f"https://www.checkers.co.za{link}"
+
         img = card.select_one("img[src], img[data-src]")
         img_url = img.get("src") or img.get("data-src") if img else None
 
@@ -210,12 +254,17 @@ async def run() -> None:
     try:
         ingredients: List[str] = json.loads(INGREDIENTS_JSON)
     except Exception:
-        ingredients = ["cheddar cheese","milk","beef mince"]
+        ingredients = ["cheddar cheese", "milk", "beef mince"]
 
     async with async_playwright() as p:
         for ing in ingredients:
             try:
                 hits = await search_checkers(p, ing)
+                if not hits and len(ing.split()) > 1:
+                    broad = ing.split()[-1]
+                    print(f"[INFO] No hits for '{ing}', retrying broader term '{broad}'")
+                    hits = await search_checkers(p, broad)
+
                 best = pick_best(ing, hits)
                 if not best:
                     print(f"[MISS] {ing}: no products parsed")
