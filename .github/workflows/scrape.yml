@@ -18,14 +18,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # install dependencies
       - run: pip install -r requirements.txt
+
+      # install browsers for Playwright
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps
+
+      # add your Firebase service account key
       - name: Write Firebase service account key
         run: echo '${{ secrets.GCP_SA_KEY }}' > $GOOGLE_APPLICATION_CREDENTIALS
+
+      # run your scraper
       - name: Scrape & write prices
-      - name: Upload debug HTML (if any)
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-html
-          path: debug/*.html
-          if-no-files-found: ignore
-          run: python scrape_prices.py
+        run: python scrape_prices.py
