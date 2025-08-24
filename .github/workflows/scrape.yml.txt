@@ -1,0 +1,25 @@
+name: Monthly scrape
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"    # runs at 00:00 UTC on the 1st of each month
+  workflow_dispatch: {}     # lets you run it manually now
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-key.json
+      REGIONS: "ZA-WC-CT"
+      STORE: "CHECKERS"
+      INGREDIENTS_JSON: '["cheddar cheese","milk","beef mince"]'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Write Firebase service account key
+        run: echo '${{ secrets.GCP_SA_KEY }}' > $GOOGLE_APPLICATION_CREDENTIALS
+      - name: Scrape & write prices
+        run: python scrape_prices.py
