@@ -185,11 +185,12 @@ async def main():
             print(f"Searching: {ing}")
             result = await search_checkers(pw, ing)
             if result is None:
-                print(f"  ❌ No real result parsed for: {ing} (left unchanged). Check debug/ artifacts.")
+                print(f"[MISS] No real result parsed for: {ing} (left unchanged). Check debug/ artifacts.")
                 continue
 
-            print(f"  ✅ {result['productName']} — R{result['price']:.2f} ({result['size']})")
+            print(f"[OK] {result['productName']} | R{result['price']:.2f} | {result['size']}")
             write_to_firestore(db, REGIONS, STORE, result)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
