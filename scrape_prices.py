@@ -47,9 +47,9 @@ async def search_checkers_site(pw, ingredient: str) -> dict | None:
 
             # small soft waits + light scroll to let lazy content render
             await page.wait_for_timeout(1500)
-            for _ in range(2):
+            for _ in range(5):
                 await page.mouse.wheel(0, 1200)
-                await page.wait_for_timeout(600)
+                await page.wait_for_timeout(1200)
 
             html = await page.content()
             soup = BeautifulSoup(html, "lxml")
@@ -159,9 +159,9 @@ async def search_sixty60(pw, ingredient: str) -> dict | None:
 
             # soft waits + light scroll
             await page.wait_for_timeout(1500)
-            for _ in range(2):
+            for _ in range(5):
                 await page.mouse.wheel(0, 1200)
-                await page.wait_for_timeout(600)
+                await page.wait_for_timeout(1200)
 
             html = await page.content()
             soup = BeautifulSoup(html, "lxml")
@@ -205,3 +205,4 @@ async def search_sixty60(pw, ingredient: str) -> dict | None:
     finally:
         await ctx.close()
         await browser.close()
+
