@@ -1,196 +1,207 @@
-# scrape_prices.py
-import os
-import re
-import json
-import asyncio
-from datetime import datetime, timezone
+# add at top with others
+from bs4 import BeautifulSoup
 
-from google.cloud import firestore
-from playwright.async_api import async_playwright
-
-# --------- Config from env (set in workflow) ----------
-REGIONS = os.getenv("REGIONS", "ZA-WC-CT")        # e.g. 'ZA-WC-CT'
-STORE   = os.getenv("STORE", "CHECKERS")          # 'CHECKERS'
-ING_JSON = os.getenv("INGREDIENTS_JSON", '["cheddar cheese","milk","beef mince"]')
-INGREDIENTS = json.loads(ING_JSON)
-
-# Where to dump debug if parser fails
-DEBUG_DIR = os.path.join("debug")
-os.makedirs(DEBUG_DIR, exist_ok=True)
-
-# --------- Helpers -----------------------------------
-def parse_price(text: str) -> float | None:
-    """
-    Pulls a number like R84.99 (or 84.99) from text.
-    Returns float or None.
-    """
-    if not text:
+def _price_from_text(txt: str) -> float | None:
+    if not txt:
         return None
-    m = re.search(r"R?\s*([0-9]+(?:[.,][0-9]{2})?)", text, re.IGNORECASE)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
+    m = re.search(r"R?\s*([0-9]+(?:[.,][0-9]{2})?)", txt)
+    return float(m.group(1).replace(",", ".")) if m else None
 
-def guess_size(name: str) -> str | None:
-    """
-    Extracts a rough size, e.g., '200 g', '500 g', '1 kg', '2 L', from product name.
-    """
-    if not name:
-        return None
-    m = re.search(r"(\b[0-9]+(?:\.[0-9]+)?\s*(?:g|kg|ml|l|L)\b)", name)
-    return m.group(1) if m else None
+def _size_guess(name: str) -> str:
+    m = re.search(r"\b(\d+(?:\.\d+)?\s*(?:g|kg|ml|l|L))\b", name or "")
+    return m.group(1) if m else ""
 
-async def accept_cookies(page):
-    # Try a few common cookie buttons
-    selectors = [
-        'button:has-text("Accept")',
-        'button:has-text("ACCEPT ALL")',
-        'button:has-text("I Accept")',
-        'button[aria-label*="Accept"]',
+def _best_hit(ingredient: str, hits: list[dict]) -> dict | None:
+    if not hits:
+        return None
+    A = set(re.findall(r"\w+", ingredient.lower()))
+    def score(h):
+        B = set(re.findall(r"\w+", h["name"].lower()))
+        overlap = len(A & B) / max(1, len(A))
+        return (-overlap, h["price"])
+    return sorted(hits, key=score)[0]
+
+# ---------- checkers.co.za ----------
+async def search_checkers_site(pw, ingredient: str) -> dict | None:
+    # try both ?search= and ?Search=
+    urls = [
+        f"https://www.checkers.co.za/search/all?q={ingredient.replace(' ', '%20')}",
+        f"https://www.checkers.co.za/search?search={ingredient.replace(' ', '%20')}",
+        f"https://www.checkers.co.za/search?Search={ingredient.replace(' ', '%20')}",
     ]
-    for sel in selectors:
-        try:
-            btn = page.locator(sel)
-            if await btn.first.is_visible():
-                await btn.first.click(timeout=500)
-                break
-        except Exception:
-            pass
-
-async def search_checkers(pw, ingredient: str):
-    """
-    Returns dict with real values or None if not found:
-      {
-        "ingredient": ...,
-        "productName": ...,
-        "price": 84.99,
-        "size": "200 g",
-        "url": "https://www.sixty60.co.za/...."
-      }
-    """
-    url = f"https://www.sixty60.co.za/search?search={ingredient.replace(' ', '%20')}"
     browser = await pw.chromium.launch(headless=True)
-    context = await browser.new_context(
-        # helps look less like a bot
-        viewport={"width": 1280, "height": 900},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+    ctx = await browser.new_context(
+        viewport={"width": 1366, "height": 900},
+        locale="en-ZA",
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"),
     )
-    page = await context.new_page()
-
+    page = await ctx.new_page()
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await accept_cookies(page)
-
-        # Wait for any product card to show up
-        cards = page.locator('div[class*="product-card_container"]')
-        await cards.first.wait_for(state="visible", timeout=15000)
-
-        # Take first reasonable product
-        count = await cards.count()
-        for i in range(min(count, 6)):  # look at the first few cards
-            card = cards.nth(i)
-
-            # Name
-            name_el = card.locator('p[class*="product-card_product-name"]')
-            name = (await name_el.text_content()) if await name_el.count() else None
-            if not name:
-                # last resort: any <p> inside card with decent length
-                try:
-                    name = await card.locator("p").nth(0).text_content()
-                except Exception:
-                    name = None
-
-            # Price text usually inside price-display_* structure
-            price_el = card.locator('p[class*="price-display_price-text"]')
-            price_text = (await price_el.text_content()) if await price_el.count() else None
-            # fallback: any text in card containing 'R'
-            if not price_text:
-                try:
-                    price_text = await card.locator(":text-matches('R\\s*\\d+')").first.text_content()
-                except Exception:
-                    price_text = None
-
-            price = parse_price(price_text or "")
-            if not (name and price):
-                # Skip cards with missing data
+        for url in urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
                 continue
 
-            size = guess_size(name)
-            # Build product URL from current page + scroll target (best effort)
-            product_url = page.url
+            # small soft waits + light scroll to let lazy content render
+            await page.wait_for_timeout(1500)
+            for _ in range(2):
+                await page.mouse.wheel(0, 1200)
+                await page.wait_for_timeout(600)
 
-            return {
-                "ingredient": ingredient,
-                "productName": name.strip(),
-                "price": price,
-                "size": size or "",
-                "url": product_url,
-            }
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
 
-        # If we got here, parsing failed: dump debug
-        html = await page.content()
-        with open(os.path.join(DEBUG_DIR, f"{ingredient.replace(' ','_')}.html"), "w", encoding="utf-8") as f:
-            f.write(html)
-        await page.screenshot(path=os.path.join(DEBUG_DIR, f"{ingredient.replace(' ','_')}.png"), full_page=True)
-        return None
+            # Broad product tile selectors used on checkers web
+            card_sel = [
+                "[class*='product-list__item']",
+                "[data-component='product-tile']",
+                "[class*='product-grid__item']",
+                "div.product, li.product",
+            ]
+            name_sel = [
+                "[class*='item-name']",
+                "[class*='product__name']",
+                "[class*='product-title']",
+                "[itemprop='name']",
+                "img[alt]",
+            ]
+            price_sel = [
+                "[class*='price']", ".price", ".now",
+            ]
 
-    except Exception as e:
-        # Keep a breadcrumb for this query
-        try:
-            with open(os.path.join(DEBUG_DIR, f"{ingredient.replace(' ','_')}_error.txt"), "w", encoding="utf-8") as f:
-                f.write(repr(e))
-        except Exception:
-            pass
+            cards = []
+            for s in card_sel:
+                cards.extend(soup.select(s))
+            # de-dupe while preserving order
+            cards = list(dict.fromkeys(cards))[:40]
+
+            hits = []
+            for c in cards:
+                # name
+                nm = None
+                for ns in name_sel:
+                    el = c.select_one(ns)
+                    if el:
+                        nm = el.get("alt") if el.name == "img" else el.get_text(" ", strip=True)
+                        if nm:
+                            break
+                if not nm:
+                    continue
+
+                # price
+                pr = None
+                for ps in price_sel:
+                    el = c.select_one(ps)
+                    if el:
+                        pr = _price_from_text(el.get_text(" ", strip=True))
+                        if pr is not None:
+                            break
+                if pr is None:
+                    pr = _price_from_text(c.get_text(" ", strip=True))
+                if pr is None:
+                    continue
+
+                hits.append({
+                    "name": nm.strip(),
+                    "price": pr,
+                    "size": _size_guess(nm),
+                    "url": url,
+                })
+
+            best = _best_hit(ingredient, hits)
+            if best:
+                return best
+
         return None
     finally:
-        await context.close()
+        await ctx.close()
         await browser.close()
 
-def write_to_firestore(client, region: str, store: str, item: dict):
-    """
-    Firestore path:
-      prices/{region}/stores/{store}/items/{ingredient-lower}
-    """
-    ingredient_id = item["ingredient"].lower()
-    doc_ref = (
-        client.collection("prices")
-        .document(region)
-        .collection("stores")
-        .document(store)
-        .collection("items")
-        .document(ingredient_id)
+# ---------- sixty60.co.za ----------
+async def search_sixty60(pw, ingredient: str) -> dict | None:
+    urls = [
+        f"https://www.sixty60.co.za/search?search={ingredient.replace(' ', '%20')}",
+        f"https://www.sixty60.co.za/search?Search={ingredient.replace(' ', '%20')}",
+    ]
+    browser = await pw.chromium.launch(headless=True)
+    ctx = await browser.new_context(
+        viewport={"width": 1366, "height": 900},
+        locale="en-ZA",
+        timezone_id="Africa/Johannesburg",
+        geolocation={"latitude": -33.9249, "longitude": 18.4241},  # Cape Town
+        permissions=["geolocation"],
+        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"),
+        extra_http_headers={"Accept-Language": "en-ZA,en;q=0.9"},
     )
-    payload = {
-        "ingredient": item["ingredient"],
-        "productName": item["productName"],
-        "price": item["price"],                # price of the pack on the site
-        "size": item["size"],                  # best-effort pack size (e.g., '200 g')
-        "store": store,
-        "region": region,
-        "url": item["url"],
-        "updatedAt": datetime.now(timezone.utc),
-    }
-    doc_ref.set(payload, merge=True)
-
-async def main():
-    # Firebase setup: GOOGLE_APPLICATION_CREDENTIALS must be set
-    db = firestore.Client()
-
-    async with async_playwright() as pw:
-        for ing in INGREDIENTS:
-            print(f"Searching: {ing}")
-            result = await search_checkers(pw, ing)
-            if result is None:
-                print(f"[MISS] No real result parsed for: {ing} (left unchanged). Check debug/ artifacts.")
+    page = await ctx.new_page()
+    try:
+        for url in urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
                 continue
 
-            print(f"[OK] {result['productName']} | R{result['price']:.2f} | {result['size']}")
-            write_to_firestore(db, REGIONS, STORE, result)
+            # Dismiss cookie banners if present (best-effort)
+            for sel in [
+                "button:has-text('Accept')", "button:has-text('ACCEPT')",
+                "button[aria-label*='Accept']"
+            ]:
+                try:
+                    await page.locator(sel).first.click(timeout=800)
+                    break
+                except Exception:
+                    pass
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            # soft waits + light scroll
+            await page.wait_for_timeout(1500)
+            for _ in range(2):
+                await page.mouse.wheel(0, 1200)
+                await page.wait_for_timeout(600)
 
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
+
+            # Sixty60 module class names – use contains()
+            cards = soup.select('div[class*="product-card_container"]')
+            hits = []
+            for c in cards[:40]:
+                # name
+                nm_el = c.select_one('[class*="product-card_product-name"]')
+                nm = nm_el.get_text(" ", strip=True) if nm_el else None
+                if not nm:
+                    img = c.select_one("img[alt]")
+                    if img and img.get("alt"):
+                        nm = img["alt"]
+                if not nm:
+                    continue
+
+                # price — full + half spans or any text containing ‘R’
+                full = c.select_one('[class*="price-display_full"]')
+                half = c.select_one('[class*="price-display_half"]')
+                txt = ""
+                if full: txt += full.get_text(strip=True)
+                if half: txt += half.get_text(strip=True)
+                pr = _price_from_text(txt) or _price_from_text(c.get_text(" ", strip=True))
+                if pr is None:
+                    continue
+
+                hits.append({
+                    "name": nm.strip(),
+                    "price": pr,
+                    "size": _size_guess(nm),
+                    "url": url,
+                })
+
+            best = _best_hit(ingredient, hits)
+            if best:
+                return best
+
+        return None
+    finally:
+        await ctx.close()
+        await browser.close()
